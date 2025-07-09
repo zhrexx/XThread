@@ -1,3 +1,5 @@
+// XThread (https://github.com/zhrexx/XThread/) is a TinyCThread based Threading Library it uses TCT as source base but improves it mostly by simplifying things
+
 #ifndef XTHREAD_H
 #define XTHREAD_H
 
