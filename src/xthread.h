@@ -1,5 +1,5 @@
-#ifndef TINYCTHREAD_H
-#define TINYCTHREAD_H
+#ifndef XTHREAD_H
+#define XTHREAD_H
 
 #include <stdatomic.h>
 #include <stdbool.h>
@@ -11,19 +11,19 @@ extern "C" {
 #endif
 
 #if defined(_WIN32) || defined(__WIN32__) || defined(__WINDOWS__)
-    #define TINYCTHREAD_PLATFORM_WINDOWS
+    #define XTHREAD_PLATFORM_WINDOWS
     #include <windows.h>
 #else
-    #define TINYCTHREAD_PLATFORM_POSIX
+    #define XTHREAD_PLATFORM_POSIX
     #include <pthread.h>
     #include <sched.h>
     #include <unistd.h>
     #include <errno.h>
 #endif
 
-#define TINYCTHREAD_VERSION_MAJOR 2
-#define TINYCTHREAD_VERSION_MINOR 0
-#define TINYCTHREAD_VERSION (TINYCTHREAD_VERSION_MAJOR * 100 + TINYCTHREAD_VERSION_MINOR)
+#define XTHREAD_VERSION_MAJOR 1
+#define XTHREAD_VERSION_MINOR 0
+#define XTHREAD_VERSION (XTHREAD_VERSION_MAJOR * 100 + XTHREAD_VERSION_MINOR)
 
 typedef enum {
     THRD_SUCCESS = 0,
@@ -42,15 +42,19 @@ typedef enum {
 typedef int (*thrd_start_t)(void *arg);
 typedef void (*tss_dtor_t)(void *val);
 
-#ifdef TINYCTHREAD_PLATFORM_WINDOWS
+#ifdef XTHREAD_PLATFORM_WINDOWS
 typedef HANDLE thrd_t;
 typedef DWORD tss_t;
 typedef struct {
     union {
-        CRITICAL_SECTION cs;
-        HANDLE mut;
+        CRITICAL_SECTION cs;  // for recursive, non-timed
+        HANDLE mut;           // for non-recursive
+        struct {
+            HANDLE mut;
+            atomic_uint owner;
+            atomic_int count;
+        } rec_timed;          // for recursive and timed
     } handle;
-    atomic_bool already_locked;
     bool is_recursive;
     bool is_timed;
 } mtx_t;
@@ -105,7 +109,7 @@ void tss_delete(tss_t key);
 void *tss_get(tss_t key);
 int tss_set(tss_t key, void *val);
 
-#ifdef TINYCTHREAD_PLATFORM_WINDOWS
+#ifdef XTHREAD_PLATFORM_WINDOWS
 void call_once(once_flag *flag, void (*func)(void));
 #else
     #define call_once(flag, func) pthread_once(flag, func)

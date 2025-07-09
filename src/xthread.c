@@ -10,7 +10,7 @@ typedef struct {
     void *arg;
 } _thread_start_info;
 
-#ifdef TINYCTHREAD_PLATFORM_WINDOWS
+#ifdef XTHREAD_PLATFORM_WINDOWS
 static DWORD WINAPI _thrd_wrapper_function(LPVOID arg)
 #else
 static void* _thrd_wrapper_function(void *arg)
@@ -19,12 +19,12 @@ static void* _thrd_wrapper_function(void *arg)
     _thread_start_info *info = (_thread_start_info*)arg;
     thrd_start_t func = info->function;
     void *thread_arg = info->arg;
-    
+
     free(info);
-    
+
     int result = func(thread_arg);
-    
-    #ifdef TINYCTHREAD_PLATFORM_WINDOWS
+
+    #ifdef XTHREAD_PLATFORM_WINDOWS
     return (DWORD)result;
     #else
     return (void*)(intptr_t)result;
@@ -33,13 +33,21 @@ static void* _thrd_wrapper_function(void *arg)
 
 int mtx_init(mtx_t *mtx, int type)
 {
-    #ifdef TINYCTHREAD_PLATFORM_WINDOWS
-    mtx->already_locked = false;
+    #ifdef XTHREAD_PLATFORM_WINDOWS
     mtx->is_recursive = type & MTX_RECURSIVE;
     mtx->is_timed = type & MTX_TIMED;
-    
-    if (!mtx->is_timed) {
-        InitializeCriticalSection(&mtx->handle.cs);
+
+    if (mtx->is_recursive) {
+        if (mtx->is_timed) {
+            mtx->handle.rec_timed.mut = CreateMutex(NULL, FALSE, NULL);
+            if (mtx->handle.rec_timed.mut == NULL) {
+                return THRD_ERROR;
+            }
+            atomic_init(&mtx->handle.rec_timed.owner, 0);
+            atomic_init(&mtx->handle.rec_timed.count, 0);
+        } else {
+            InitializeCriticalSection(&mtx->handle.cs);
+        }
     } else {
         mtx->handle.mut = CreateMutex(NULL, FALSE, NULL);
         if (mtx->handle.mut == NULL) {
@@ -47,27 +55,31 @@ int mtx_init(mtx_t *mtx, int type)
         }
     }
     return THRD_SUCCESS;
-    
+
     #else
     pthread_mutexattr_t attr;
     pthread_mutexattr_init(&attr);
-    
+
     if (type & MTX_RECURSIVE) {
         pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
     }
-    
+
     int result = pthread_mutex_init(mtx, &attr);
     pthread_mutexattr_destroy(&attr);
-    
+
     return result == 0 ? THRD_SUCCESS : THRD_ERROR;
     #endif
 }
 
 void mtx_destroy(mtx_t *mtx)
 {
-    #ifdef TINYCTHREAD_PLATFORM_WINDOWS
-    if (!mtx->is_timed) {
-        DeleteCriticalSection(&mtx->handle.cs);
+    #ifdef XTHREAD_PLATFORM_WINDOWS
+    if (mtx->is_recursive) {
+        if (mtx->is_timed) {
+            CloseHandle(mtx->handle.rec_timed.mut);
+        } else {
+            DeleteCriticalSection(&mtx->handle.cs);
+        }
     } else {
         CloseHandle(mtx->handle.mut);
     }
@@ -78,27 +90,29 @@ void mtx_destroy(mtx_t *mtx)
 
 int mtx_lock(mtx_t *mtx)
 {
-    #ifdef TINYCTHREAD_PLATFORM_WINDOWS
-    if (!mtx->is_timed) {
-        EnterCriticalSection(&mtx->handle.cs);
-    } else {
-        switch (WaitForSingleObject(mtx->handle.mut, INFINITE)) {
-            case WAIT_OBJECT_0:
-                break;
-            case WAIT_ABANDONED:
-            default:
+    #ifdef XTHREAD_PLATFORM_WINDOWS
+    if (mtx->is_recursive) {
+        if (mtx->is_timed) {
+            DWORD self = GetCurrentThreadId();
+            if (atomic_load(&mtx->handle.rec_timed.owner) == self) {
+                atomic_fetch_add(&mtx->handle.rec_timed.count, 1);
+                return THRD_SUCCESS;
+            }
+            if (WaitForSingleObject(mtx->handle.rec_timed.mut, INFINITE) != WAIT_OBJECT_0) {
                 return THRD_ERROR;
+            }
+            atomic_store(&mtx->handle.rec_timed.owner, self);
+            atomic_store(&mtx->handle.rec_timed.count, 1);
+        } else {
+            EnterCriticalSection(&mtx->handle.cs);
         }
-    }
-
-    if (!mtx->is_recursive) {
-        while (mtx->already_locked) {
-            Sleep(1);
+    } else {
+        if (WaitForSingleObject(mtx->handle.mut, INFINITE) != WAIT_OBJECT_0) {
+            return THRD_ERROR;
         }
-        mtx->already_locked = true;
     }
     return THRD_SUCCESS;
-    
+
     #else
     return pthread_mutex_lock(mtx) == 0 ? THRD_SUCCESS : THRD_ERROR;
     #endif
@@ -106,65 +120,75 @@ int mtx_lock(mtx_t *mtx)
 
 int mtx_timedlock(mtx_t *mtx, const struct timespec *ts)
 {
-    #ifdef TINYCTHREAD_PLATFORM_WINDOWS
-    if (!mtx->is_timed) {
+    #ifdef XTHREAD_PLATFORM_WINDOWS
+    if (mtx->is_recursive && mtx->is_timed) {
+        DWORD self = GetCurrentThreadId();
+        if (atomic_load(&mtx->handle.rec_timed.owner) == self) {
+            atomic_fetch_add(&mtx->handle.rec_timed.count, 1);
+            return THRD_SUCCESS;
+        }
+        struct timespec current_ts;
+        timespec_get(&current_ts, TIME_UTC);
+        if (current_ts.tv_sec > ts->tv_sec ||
+            (current_ts.tv_sec == ts->tv_sec && current_ts.tv_nsec >= ts->tv_nsec)) {
+            return THRD_TIMEOUT;
+        }
+        DWORD timeout_ms = (DWORD)((ts->tv_sec - current_ts.tv_sec) * 1000 +
+                                   (ts->tv_nsec - current_ts.tv_nsec) / 1000000);
+        DWORD result = WaitForSingleObject(mtx->handle.rec_timed.mut, timeout_ms);
+        if (result == WAIT_OBJECT_0) {
+            atomic_store(&mtx->handle.rec_timed.owner, self);
+            atomic_store(&mtx->handle.rec_timed.count, 1);
+            return THRD_SUCCESS;
+        } else if (result == WAIT_TIMEOUT) {
+            return THRD_TIMEOUT;
+        } else {
+            return THRD_ERROR;
+        }
+    } else if (mtx->is_timed) {
+        struct timespec current_ts;
+        timespec_get(&current_ts, TIME_UTC);
+        if (current_ts.tv_sec > ts->tv_sec ||
+            (current_ts.tv_sec == ts->tv_sec && current_ts.tv_nsec >= ts->tv_nsec)) {
+            return THRD_TIMEOUT;
+        }
+        DWORD timeout_ms = (DWORD)((ts->tv_sec - current_ts.tv_sec) * 1000 +
+                                   (ts->tv_nsec - current_ts.tv_nsec) / 1000000);
+        DWORD result = WaitForSingleObject(mtx->handle.mut, timeout_ms);
+        if (result == WAIT_OBJECT_0) {
+            return THRD_SUCCESS;
+        } else if (result == WAIT_TIMEOUT) {
+            return THRD_TIMEOUT;
+        } else {
+            return THRD_ERROR;
+        }
+    } else {
         return THRD_ERROR;
     }
 
-    struct timespec current_ts;
-    timespec_get(&current_ts, TIME_UTC);
-
-    DWORD timeout_ms = (current_ts.tv_sec > ts->tv_sec || 
-                        (current_ts.tv_sec == ts->tv_sec && current_ts.tv_nsec >= ts->tv_nsec)) 
-                       ? 0 
-                       : (DWORD)((ts->tv_sec - current_ts.tv_sec) * 1000 + 
-                                  (ts->tv_nsec - current_ts.tv_nsec) / 1000000 + 1);
-
-    switch (WaitForSingleObject(mtx->handle.mut, timeout_ms)) {
-        case WAIT_OBJECT_0:
-            break;
-        case WAIT_TIMEOUT:
-            return THRD_TIMEOUT;
-        case WAIT_ABANDONED:
-        default:
-            return THRD_ERROR;
-    }
-
-    if (!mtx->is_recursive) {
-        while (mtx->already_locked) {
-            Sleep(1);
-        }
-        mtx->already_locked = true;
-    }
-    return THRD_SUCCESS;
-    
     #elif defined(_POSIX_TIMEOUTS) && (_POSIX_TIMEOUTS >= 200112L)
     switch (pthread_mutex_timedlock(mtx, ts)) {
         case 0: return THRD_SUCCESS;
         case ETIMEDOUT: return THRD_TIMEOUT;
         default: return THRD_ERROR;
     }
-    
+
     #else
     int rc;
     struct timespec cur, remaining;
 
     while ((rc = pthread_mutex_trylock(mtx)) == EBUSY) {
         timespec_get(&cur, TIME_UTC);
-
-        if (cur.tv_sec > ts->tv_sec || 
+        if (cur.tv_sec > ts->tv_sec ||
             (cur.tv_sec == ts->tv_sec && cur.tv_nsec >= ts->tv_nsec)) {
             break;
         }
-
         remaining.tv_sec = ts->tv_sec - cur.tv_sec;
         remaining.tv_nsec = ts->tv_nsec - cur.tv_nsec;
-        
         if (remaining.tv_nsec < 0) {
             remaining.tv_sec--;
             remaining.tv_nsec += 1000000000;
         }
-
         nanosleep(&remaining, NULL);
     }
 
@@ -179,24 +203,36 @@ int mtx_timedlock(mtx_t *mtx, const struct timespec *ts)
 
 int mtx_trylock(mtx_t *mtx)
 {
-    #ifdef TINYCTHREAD_PLATFORM_WINDOWS
-    int result;
-    if (!mtx->is_timed) {
-        result = TryEnterCriticalSection(&mtx->handle.cs) ? THRD_SUCCESS : THRD_BUSY;
-    } else {
-        result = (WaitForSingleObject(mtx->handle.mut, 0) == WAIT_OBJECT_0) ? THRD_SUCCESS : THRD_BUSY;
-    }
-
-    if (!mtx->is_recursive && result == THRD_SUCCESS) {
-        if (mtx->already_locked) {
-            LeaveCriticalSection(&mtx->handle.cs);
-            result = THRD_BUSY;
+    #ifdef XTHREAD_PLATFORM_WINDOWS
+    if (mtx->is_recursive) {
+        if (mtx->is_timed) {
+            DWORD self = GetCurrentThreadId();
+            if (atomic_load(&mtx->handle.rec_timed.owner) == self) {
+                atomic_fetch_add(&mtx->handle.rec_timed.count, 1);
+                return THRD_SUCCESS;
+            }
+            if (WaitForSingleObject(mtx->handle.rec_timed.mut, 0) == WAIT_OBJECT_0) {
+                atomic_store(&mtx->handle.rec_timed.owner, self);
+                atomic_store(&mtx->handle.rec_timed.count, 1);
+                return THRD_SUCCESS;
+            } else {
+                return THRD_BUSY;
+            }
         } else {
-            mtx->already_locked = true;
+            if (TryEnterCriticalSection(&mtx->handle.cs)) {
+                return THRD_SUCCESS;
+            } else {
+                return THRD_BUSY;
+            }
+        }
+    } else {
+        if (WaitForSingleObject(mtx->handle.mut, 0) == WAIT_OBJECT_0) {
+            return THRD_SUCCESS;
+        } else {
+            return THRD_BUSY;
         }
     }
-    return result;
-    
+
     #else
     return (pthread_mutex_trylock(mtx) == 0) ? THRD_SUCCESS : THRD_BUSY;
     #endif
@@ -204,17 +240,27 @@ int mtx_trylock(mtx_t *mtx)
 
 int mtx_unlock(mtx_t *mtx)
 {
-    #ifdef TINYCTHREAD_PLATFORM_WINDOWS
-    mtx->already_locked = false;
-    if (!mtx->is_timed) {
-        LeaveCriticalSection(&mtx->handle.cs);
+    #ifdef XTHREAD_PLATFORM_WINDOWS
+    if (mtx->is_recursive) {
+        if (mtx->is_timed) {
+            int count = atomic_fetch_sub(&mtx->handle.rec_timed.count, 1) - 1;
+            if (count > 0) {
+                return THRD_SUCCESS;
+            }
+            atomic_store(&mtx->handle.rec_timed.owner, 0);
+            if (!ReleaseMutex(mtx->handle.rec_timed.mut)) {
+                return THRD_ERROR;
+            }
+        } else {
+            LeaveCriticalSection(&mtx->handle.cs);
+        }
     } else {
         if (!ReleaseMutex(mtx->handle.mut)) {
             return THRD_ERROR;
         }
     }
     return THRD_SUCCESS;
-    
+
     #else
     return pthread_mutex_unlock(mtx) == 0 ? THRD_SUCCESS : THRD_ERROR;
     #endif
@@ -222,7 +268,7 @@ int mtx_unlock(mtx_t *mtx)
 
 int cnd_init(cnd_t *cond)
 {
-    #ifdef TINYCTHREAD_PLATFORM_WINDOWS
+    #ifdef XTHREAD_PLATFORM_WINDOWS
     cond->waiters_count = 0;
     InitializeCriticalSection(&cond->waiters_lock);
 
@@ -240,7 +286,7 @@ int cnd_init(cnd_t *cond)
     }
 
     return THRD_SUCCESS;
-    
+
     #else
     return pthread_cond_init(cond, NULL) == 0 ? THRD_SUCCESS : THRD_ERROR;
     #endif
@@ -248,7 +294,7 @@ int cnd_init(cnd_t *cond)
 
 void cnd_destroy(cnd_t *cond)
 {
-    #ifdef TINYCTHREAD_PLATFORM_WINDOWS
+    #ifdef XTHREAD_PLATFORM_WINDOWS
     if (cond->events[0] != NULL) {
         CloseHandle(cond->events[0]);
     }
@@ -256,7 +302,7 @@ void cnd_destroy(cnd_t *cond)
         CloseHandle(cond->events[1]);
     }
     DeleteCriticalSection(&cond->waiters_lock);
-    
+
     #else
     pthread_cond_destroy(cond);
     #endif
@@ -264,7 +310,7 @@ void cnd_destroy(cnd_t *cond)
 
 int cnd_signal(cnd_t *cond)
 {
-    #ifdef TINYCTHREAD_PLATFORM_WINDOWS
+    #ifdef XTHREAD_PLATFORM_WINDOWS
     bool have_waiters;
 
     EnterCriticalSection(&cond->waiters_lock);
@@ -276,7 +322,7 @@ int cnd_signal(cnd_t *cond)
     }
 
     return THRD_SUCCESS;
-    
+
     #else
     return pthread_cond_signal(cond) == 0 ? THRD_SUCCESS : THRD_ERROR;
     #endif
@@ -284,7 +330,7 @@ int cnd_signal(cnd_t *cond)
 
 int cnd_broadcast(cnd_t *cond)
 {
-    #ifdef TINYCTHREAD_PLATFORM_WINDOWS
+    #ifdef XTHREAD_PLATFORM_WINDOWS
     bool have_waiters;
 
     EnterCriticalSection(&cond->waiters_lock);
@@ -296,7 +342,7 @@ int cnd_broadcast(cnd_t *cond)
     }
 
     return THRD_SUCCESS;
-    
+
     #else
     return pthread_cond_broadcast(cond) == 0 ? THRD_SUCCESS : THRD_ERROR;
     #endif
@@ -304,7 +350,7 @@ int cnd_broadcast(cnd_t *cond)
 
 int cnd_wait(cnd_t *cond, mtx_t *mtx)
 {
-    #ifdef TINYCTHREAD_PLATFORM_WINDOWS
+    #ifdef XTHREAD_PLATFORM_WINDOWS
     static const DWORD timeout = INFINITE;
     DWORD result;
     bool last_waiter;
@@ -338,7 +384,7 @@ int cnd_wait(cnd_t *cond, mtx_t *mtx)
 
     mtx_lock(mtx);
     return THRD_SUCCESS;
-    
+
     #else
     return pthread_cond_wait(cond, mtx) == 0 ? THRD_SUCCESS : THRD_ERROR;
     #endif
@@ -346,13 +392,13 @@ int cnd_wait(cnd_t *cond, mtx_t *mtx)
 
 int cnd_timedwait(cnd_t *cond, mtx_t *mtx, const struct timespec *ts)
 {
-    #ifdef TINYCTHREAD_PLATFORM_WINDOWS
+    #ifdef XTHREAD_PLATFORM_WINDOWS
     struct timespec now;
     if (timespec_get(&now, TIME_UTC) == TIME_UTC) {
         unsigned long long now_ms = now.tv_sec * 1000 + now.tv_nsec / 1000000;
         unsigned long long ts_ms = ts->tv_sec * 1000 + ts->tv_nsec / 1000000;
         DWORD delta = (ts_ms > now_ms) ? (DWORD)(ts_ms - now_ms) : 0;
-        
+
         DWORD result = WaitForMultipleObjects(2, cond->events, FALSE, delta);
         if (result == WAIT_TIMEOUT) {
             return THRD_TIMEOUT;
@@ -362,7 +408,7 @@ int cnd_timedwait(cnd_t *cond, mtx_t *mtx, const struct timespec *ts)
         return THRD_SUCCESS;
     }
     return THRD_ERROR;
-    
+
     #else
     int ret = pthread_cond_timedwait(cond, mtx, ts);
     if (ret == ETIMEDOUT) {
@@ -378,17 +424,17 @@ int thrd_create(thrd_t *thr, thrd_start_t func, void *arg)
     if (!info) {
         return THRD_NO_MEM;
     }
-    
+
     info->function = func;
     info->arg = arg;
 
-    #ifdef TINYCTHREAD_PLATFORM_WINDOWS
+    #ifdef XTHREAD_PLATFORM_WINDOWS
     *thr = CreateThread(NULL, 0, _thrd_wrapper_function, info, 0, NULL);
     if (!*thr) {
         free(info);
         return THRD_ERROR;
     }
-    
+
     #else
     if (pthread_create(thr, NULL, _thrd_wrapper_function, info) != 0) {
         free(info);
@@ -401,7 +447,7 @@ int thrd_create(thrd_t *thr, thrd_start_t func, void *arg)
 
 thrd_t thrd_current(void)
 {
-    #ifdef TINYCTHREAD_PLATFORM_WINDOWS
+    #ifdef XTHREAD_PLATFORM_WINDOWS
     return GetCurrentThread();
     #else
     return pthread_self();
@@ -410,7 +456,7 @@ thrd_t thrd_current(void)
 
 int thrd_detach(thrd_t thr)
 {
-    #ifdef TINYCTHREAD_PLATFORM_WINDOWS
+    #ifdef XTHREAD_PLATFORM_WINDOWS
     return CloseHandle(thr) != 0 ? THRD_SUCCESS : THRD_ERROR;
     #else
     return pthread_detach(thr) == 0 ? THRD_SUCCESS : THRD_ERROR;
@@ -419,7 +465,7 @@ int thrd_detach(thrd_t thr)
 
 int thrd_equal(thrd_t thr0, thrd_t thr1)
 {
-    #ifdef TINYCTHREAD_PLATFORM_WINDOWS
+    #ifdef XTHREAD_PLATFORM_WINDOWS
     return GetThreadId(thr0) == GetThreadId(thr1);
     #else
     return pthread_equal(thr0, thr1);
@@ -428,7 +474,7 @@ int thrd_equal(thrd_t thr0, thrd_t thr1)
 
 _Noreturn void thrd_exit(int res)
 {
-    #ifdef TINYCTHREAD_PLATFORM_WINDOWS
+    #ifdef XTHREAD_PLATFORM_WINDOWS
     ExitThread((DWORD)res);
     #else
     pthread_exit((void*)(intptr_t)res);
@@ -437,7 +483,7 @@ _Noreturn void thrd_exit(int res)
 
 int thrd_join(thrd_t thr, int *res)
 {
-    #ifdef TINYCTHREAD_PLATFORM_WINDOWS
+    #ifdef XTHREAD_PLATFORM_WINDOWS
     DWORD dwRes;
 
     if (WaitForSingleObject(thr, INFINITE) == WAIT_FAILED) {
@@ -451,31 +497,31 @@ int thrd_join(thrd_t thr, int *res)
             return THRD_ERROR;
         }
     }
-    
+
     CloseHandle(thr);
-    
+
     #else
     void *pres;
     if (pthread_join(thr, &pres) != 0) {
         return THRD_ERROR;
     }
-    
+
     if (res != NULL) {
         *res = (int)(intptr_t)pres;
     }
     #endif
-    
+
     return THRD_SUCCESS;
 }
 
 int thrd_sleep(const struct timespec *duration, struct timespec *remaining)
 {
-    #ifdef TINYCTHREAD_PLATFORM_WINDOWS
+    #ifdef XTHREAD_PLATFORM_WINDOWS
     struct timespec start;
     timespec_get(&start, TIME_UTC);
 
     DWORD sleep_result = SleepEx(
-        (DWORD)(duration->tv_sec * 1000 + duration->tv_nsec / 1000000 + 
+        (DWORD)(duration->tv_sec * 1000 + duration->tv_nsec / 1000000 +
                 (duration->tv_nsec % 1000000 != 0)),
         TRUE
     );
@@ -487,7 +533,7 @@ int thrd_sleep(const struct timespec *duration, struct timespec *remaining)
             timespec_get(remaining, TIME_UTC);
             remaining->tv_sec -= start.tv_sec;
             remaining->tv_nsec -= start.tv_nsec;
-            
+
             if (remaining->tv_nsec < 0) {
                 remaining->tv_nsec += 1000000000;
                 remaining->tv_sec -= 1;
@@ -495,7 +541,7 @@ int thrd_sleep(const struct timespec *duration, struct timespec *remaining)
         }
         return sleep_result == WAIT_IO_COMPLETION ? -1 : -2;
     }
-    
+
     #else
     int res = nanosleep(duration, remaining);
     if (res == 0) {
@@ -510,49 +556,49 @@ int thrd_sleep(const struct timespec *duration, struct timespec *remaining)
 
 void thrd_yield(void)
 {
-    #ifdef TINYCTHREAD_PLATFORM_WINDOWS
+    #ifdef XTHREAD_PLATFORM_WINDOWS
     Sleep(0);
     #else
     sched_yield();
     #endif
 }
 
-#ifdef TINYCTHREAD_PLATFORM_WINDOWS
-struct TinyCThreadTSSData {
+#ifdef XTHREAD_PLATFORM_WINDOWS
+struct XThreadTSSData {
     void *value;
     tss_t key;
-    struct TinyCThreadTSSData *next;
+    struct XThreadTSSData *next;
 };
 
-static tss_dtor_t _tinycthread_tss_dtors[1088] = { NULL };
-static _Thread_local struct TinyCThreadTSSData *_tinycthread_tss_head = NULL;
-static _Thread_local struct TinyCThreadTSSData *_tinycthread_tss_tail = NULL;
+static tss_dtor_t _xthread_tss_dtors[1088] = { NULL };
+static _Thread_local struct XThreadTSSData *_xthread_tss_head = NULL;
+static _Thread_local struct XThreadTSSData *_xthread_tss_tail = NULL;
 
 #define TSS_DTOR_ITERATIONS 4
 #endif
 
 int tss_create(tss_t *key, tss_dtor_t dtor)
 {
-    #ifdef TINYCTHREAD_PLATFORM_WINDOWS
+    #ifdef XTHREAD_PLATFORM_WINDOWS
     *key = TlsAlloc();
     if (*key == TLS_OUT_OF_INDEXES) {
         return THRD_ERROR;
     }
-    _tinycthread_tss_dtors[*key] = dtor;
+    _xthread_tss_dtors[*key] = dtor;
     #else
     if (pthread_key_create(key, dtor) != 0) {
         return THRD_ERROR;
     }
     #endif
-    
+
     return THRD_SUCCESS;
 }
 
 void tss_delete(tss_t key)
 {
-    #ifdef TINYCTHREAD_PLATFORM_WINDOWS
+    #ifdef XTHREAD_PLATFORM_WINDOWS
     TlsFree(key);
-    _tinycthread_tss_dtors[key] = NULL;
+    _xthread_tss_dtors[key] = NULL;
     #else
     pthread_key_delete(key);
     #endif
@@ -560,7 +606,7 @@ void tss_delete(tss_t key)
 
 void *tss_get(tss_t key)
 {
-    #ifdef TINYCTHREAD_PLATFORM_WINDOWS
+    #ifdef XTHREAD_PLATFORM_WINDOWS
     return TlsGetValue(key);
     #else
     return pthread_getspecific(key);
@@ -569,14 +615,14 @@ void *tss_get(tss_t key)
 
 int tss_set(tss_t key, void *val)
 {
-    #ifdef TINYCTHREAD_PLATFORM_WINDOWS
+    #ifdef XTHREAD_PLATFORM_WINDOWS
     return TlsSetValue(key, val) ? THRD_SUCCESS : THRD_ERROR;
     #else
     return pthread_setspecific(key, val) == 0 ? THRD_SUCCESS : THRD_ERROR;
     #endif
 }
 
-#ifdef TINYCTHREAD_PLATFORM_WINDOWS
+#ifdef XTHREAD_PLATFORM_WINDOWS
 void call_once(once_flag *flag, void (*func)(void))
 {
     while (flag->status < 3) {
